@@ -1,8 +1,18 @@
 # Veracode SBOM Trim
 
-Removes first-party components, unmatched files and build paths from Veracode SCA CycloneDX SBOMs. Every reference to a removed component is fixed up, and the output is checked against the CycloneDX schema before it's written.
+> **Community tool.** Not an official Veracode product and not covered by Veracode Technical Support. Use at your own discretion; issues and PRs welcome.
 
-**Why:** Veracode SBOMs list everything the scan saw. That includes your own artifacts, files Veracode couldn't identify, and build paths like `\app\target\verademo\WEB-INF\lib\x.jar`. Deleting entries by hand leaves broken `dependencies`, `vulnerabilities` and `compositions` refs, and often makes the file schema-invalid.
+Trims Veracode SCA CycloneDX SBOMs to the components you choose to keep: removes first-party code, unidentified files and build paths, fixes every reference, and validates the result. Walkthrough with real output: [docs/how-it-works.md](docs/how-it-works.md).
+
+## Why use it
+
+- **Built on Veracode's data.** Veracode SCA marks each component as matched to a known library or `Unmatched`. `--public-only` uses that to keep identified open-source libraries in one flag.
+- **Safe removals.** Removing a component also removes its `dependencies` entries, `dependsOn` refs, `vulnerabilities[].affects` and composition refs. Where Veracode provides the dependency graph (agent scans), its now-orphaned transitive dependencies go too.
+- **No leaks.** Redacted/excluded names are scrubbed from other components' paths; `--strip-paths` removes build paths entirely.
+- **Valid output, every time.** Output is schema-checked (JSON schema / XSD) before writing; on failure nothing is written. Every change is listed by `--report`.
+- **Drop-in for CI.** One file, Python 3.9+, standard library only, no network calls.
+
+## Input and output
 
 - Input: CycloneDX 1.4–1.6, JSON or XML, from the Veracode SBOM REST API (`type=application` / `type=agent`), the Veracode CLI (`veracode sbom`) or the agent CLI (`srcclr scan --sbom ...`). SPDX is rejected.
 - Output: same format as the input; `--output-format json|xml` converts. The input file is never overwritten.
@@ -25,7 +35,7 @@ Without it the tool still runs and prints a warning that validation was skipped.
 python sbom_trim.py app_sbom.json -o app_sbom.trimmed.json \
   --public-only --exclude 'pkg:maven/com.acme/*' --report
 
-# Veracode CLI (Syft) XML: drop your artifact and all build paths, keep XML
+# Veracode CLI XML: drop your artifact and all build paths, keep XML
 python sbom_trim.py cli_sbom.xml -o cli_sbom.trimmed.xml \
   --exclude 'pkg:maven/com.acme/*' --strip-paths
 
@@ -96,14 +106,14 @@ Match exact groups: `com.veracode*` also matches the public `com.veracode.annota
 | | REST API `type=application` | REST API `type=agent` | Veracode CLI `veracode sbom` |
 |---|---|---|---|
 | `--exclude` / `--redact` / `--strip-paths` | ✓ | ✓ | ✓ |
-| `--public-only` / `--drop-unmatched` | ✓ | ✓ | ✗ no match data: every file gets a purl, including your own artifact |
+| `--public-only` / `--drop-unmatched` | ✓ | ✓ | ✗ file-level inventory without match data; use `--exclude` |
 | `--direct-only` | ✗ no `dependsOn` | ✓ with `--infer-direct` | ✗ no graph |
 | `--runtime-only` | ✗ no `scope` | ✗ no `scope` | ✗ no `scope` |
 | Orphan pruning | ✗ no graph | ✓ | ✗ no graph |
 
 Unsupported flags exit with code `2` and say why. Without a graph, a removed component's transitive dependencies are kept and the report says so.
 
-Veracode CLI output lists most libraries 2–3 times (inside the `.war`, in the exploded directory, and from `pom.xml`); the tool leaves these as-is. Syft also writes pom version ranges into purls (`@[1.0.4,)`), which makes its own XML fail the 1.6 XSD. XML output percent-encodes them (`@%5B1.0.4,)`).
+Veracode CLI output records each library everywhere it was found (inside the `.war`, in the exploded directory, and in `pom.xml`); the tool keeps these entries as-is. Maven version ranges from `pom.xml` (`@[1.0.4,)`) are percent-encoded in XML output (`@%5B1.0.4,)`) so it validates against the strict 1.6 XSD.
 
 ## What changes in the output
 
