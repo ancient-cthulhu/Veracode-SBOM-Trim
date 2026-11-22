@@ -9,15 +9,15 @@ Trims Veracode SCA CycloneDX SBOMs to the components you choose to keep: removes
 - **Built on Veracode's data.** Veracode SCA marks each component as matched to a known library or `Unmatched`. `--public-only` uses that to keep identified open-source libraries in one flag.
 - **Safe removals.** Removing a component also removes its `dependencies` entries, `dependsOn` refs, `vulnerabilities[].affects` and composition refs. Where Veracode provides the dependency graph (agent scans), its now-orphaned transitive dependencies go too.
 - **No leaks.** Redacted/excluded names are scrubbed from other components' paths; `--strip-paths` removes build paths entirely.
-- **Valid output, every time.** Output is schema-checked (JSON schema / XSD) before writing; on failure nothing is written. Every change is listed by `--report`.
+- **Valid output, every time.** Output is schema-checked (JSON schema / XSD) before writing; on failure nothing is written. Validation scales linearly (10k components in a few seconds). Every change is listed by `--report`.
 - **Drop-in for CI.** One file, Python 3.9+, standard library only, no network calls.
 
 ## Input and output
 
 - Input: CycloneDX 1.4–1.6, JSON or XML, from the Veracode SBOM REST API (`type=application` / `type=agent`), the Veracode CLI (`veracode sbom`) or the agent CLI (`srcclr scan --sbom ...`). SPDX is rejected.
 - Output: same format as the input; `--output-format json|xml` converts. The input file is never overwritten.
-- Encoding: UTF-8, or UTF-16/32 with a BOM (what PowerShell `>` writes).
-- Malformed input (wrong types, components nested > 64 deep, DOCTYPE/entities in XML) exits with code `2` and the JSON path of the problem; it never writes partial output.
+- Encoding: UTF-8, or UTF-16/32 with a BOM (what PowerShell `>` writes). XML may declare `encoding="UTF-16"`.
+- Malformed input exits with code `2` and writes nothing: wrong types in the fields the tool reads (reported with their JSON path), components nested > 64 deep or any structure nested > 168 levels, `NaN`/`Infinity`, integers over 4300 digits, DOCTYPE/entities in XML. Input that parses but breaks the CycloneDX schema elsewhere (e.g. `vulnerabilities[].id` as a list) fails validation with code `3`.
 - Python 3.9+, standard library only, no network calls.
 
 ## Install
@@ -96,6 +96,7 @@ Note: the SBOM has no dependency edges (Veracode CLI `veracode sbom` / Syft outp
 | `--report` | Print before/after counts, each removed or redacted `name@version` with its rule, and notes. |
 | `--no-validate` | Skip schema validation. |
 | `--indent N` | Output indent (default 2). |
+| `--version` | Print the tool version and exit. |
 
 **Patterns:** shell globs matched against the whole value (`pkg:maven/com.acme/*`, `com.acme*`), or a regex with a `re:` prefix. `--exclude` wins over `--redact`. The root component is never removed.
 
@@ -125,7 +126,13 @@ Veracode CLI output records each library everywhere it was found (inside the `.w
 - **Metadata:** new `serialNumber`, new timestamp, `version` + 1, `sbom_trim` added to `metadata.tools`.
 - Everything else, including key order, is preserved.
 
-Exit codes: `0` ok, `2` input/option/output-path error, `3` output failed schema validation (nothing written).
+### VEX: generate it from the trimmed SBOM
+
+The trimmed SBOM is a new BOM (new `serialNumber` and `version`), so a VEX made from the full SBOM points at a document nobody receives: its BOM-Links no longer resolve. Trim first, then build the VEX from the trimmed file with [Veracode VEX Generator](https://github.com/ancient-cthulhu/Veracode-VEX-Generator), and ship the two together.
+
+`--strip-paths` (and excluding an outer archive, which rewrites its inner paths to `REDACTED`) removes the `File Path` values the VEX Generator uses to match Upload & Scan findings exactly; it then falls back to file-name matching, which can't tell apart two copies of the same library at different paths. If exact matching matters, trim without `--strip-paths` and generate the VEX from that output; otherwise accept file-name matching. Don't strip paths in a second run after making the VEX: every run issues a new `serialNumber`, which breaks the VEX links again.
+
+Exit codes: `0` ok, `2` input/option/output-path error (including output that can't be written as valid JSON/XML), `3` output failed schema validation (nothing written). Any other code is a bug; please report it.
 
 ## CI (GitHub Actions)
 

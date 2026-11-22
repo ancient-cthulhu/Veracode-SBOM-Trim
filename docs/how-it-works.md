@@ -13,7 +13,7 @@ read → check → decide → remove / redact → fix references → stamp → v
 3. **Decide** per component: keep, remove (with the rule that matched), or redact.
 4. **Remove / redact.** Redacted components become a `REDACTED` placeholder that keeps its place in the dependency graph.
 5. **Fix references** in `dependencies`, `dependsOn`, `vulnerabilities[].affects`, `compositions` and `annotations`. With a dependency graph, components only reachable through removed ones are pruned.
-6. **Stamp** a new `serialNumber`, timestamp, `version` + 1, the tool in `metadata.tools`, and a `compositions` entry stating the inventory was trimmed.
+6. **Stamp** a new `serialNumber`, timestamp, `version` + 1, the tool in `metadata.tools`, and a `compositions` entry stating the inventory was trimmed. Because it is a new BOM, build any VEX from the trimmed SBOM (see [README: VEX](../README.md#vex-generate-it-from-the-trimmed-sbom)).
 7. **Validate** against the CycloneDX JSON schema or XSD. On failure nothing is written (exit `3`).
 8. **Write** atomically. The input is never overwritten.
 
@@ -89,6 +89,8 @@ verademo.war#zip:WEB-INF/lib-provided/REDACTED:tomcat-juli-9.0.37.jar
 verademo.war#zip:WEB-INF/lib-provided/REDACTED:tomcat-servlet-api-9.0.35.jar
 verademo.war#zip:WEB-INF/lib-provided/REDACTED:tomcat-jni-9.0.36.jar
 ```
+
+Rewritten paths (and `--strip-paths`) no longer match the `File Path` that the [VEX Generator](https://github.com/ancient-cthulhu/Veracode-VEX-Generator) uses for exact Upload & Scan matching, so it falls back to file names. If you need exact matching, skip `--strip-paths` and build the VEX from that trimmed output.
 
 ## Example 4: Veracode CLI
 
