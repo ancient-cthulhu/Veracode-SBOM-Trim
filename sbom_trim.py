@@ -144,8 +144,8 @@ def read_bom(path: str) -> Tuple[Dict[str, Any], str]:
             raise TrimError("input XML is nested too deeply") from exc
     else:
         try:
-            bom = json.loads(text)
-        except json.JSONDecodeError as exc:
+            bom = json.loads(text, parse_constant=_reject_constant)
+        except ValueError as exc:  # JSONDecodeError, >4300-digit ints, NaN/Infinity
             raise TrimError(f"input is not valid JSON: {exc}") from exc
         except RecursionError as exc:
             raise TrimError("input JSON is nested too deeply") from exc
@@ -174,11 +174,41 @@ def read_bom(path: str) -> Tuple[Dict[str, Any], str]:
     return bom, fmt
 
 
+def _reject_constant(token: str) -> Any:
+    """json.loads hook: NaN/Infinity are not RFC 8259 JSON and break strict consumers."""
+    raise ValueError(f"non-standard number {token} (NaN/Infinity are not allowed in JSON)")
+
+
+def _is_ascii_digits(s: str) -> bool:
+    """str.isdigit() also accepts '²' and other Unicode digits that int() rejects."""
+    return s.isascii() and s.isdigit()
+
+
 MAX_NESTING = 64  # nested components; real SBOMs use < 5
+# Whole-document JSON depth: 64 nested components use ~130 levels. Deeper input
+# would overflow recursion in deepcopy/jsonschema/XML output.
+MAX_DEPTH = 2 * MAX_NESTING + 40
+
+
+def _too_deep(node: Any, limit: int) -> bool:
+    """True if dict/list nesting exceeds ``limit`` (iterative, so it cannot overflow)."""
+    stack = [(node, 1)]
+    while stack:
+        value, depth = stack.pop()
+        children = value.values() if isinstance(value, dict) else value
+        for child in children:
+            if isinstance(child, (dict, list)):
+                if depth + 1 > limit:
+                    return True
+                stack.append((child, depth + 1))
+    return False
 
 
 def _check_shape(bom: Dict[str, Any]) -> None:
     """Reject wrong types in the fields trim() reads, with a JSON path (no tracebacks)."""
+    if _too_deep(bom, MAX_DEPTH):
+        raise TrimError(f"malformed SBOM: input is nested more than {MAX_DEPTH} levels deep")
+
     def need(cond: bool, path: str, what: str) -> None:
         if not cond:
             raise TrimError(f"malformed SBOM: {path} must be {what}")
@@ -256,6 +286,13 @@ def _check_shape(bom: Dict[str, Any]) -> None:
 # --------------------------------------------------------------------------- #
 
 CDX_NS = "http://cyclonedx.org/schema/bom/"
+# Prolog items allowed before the root element: whitespace/BOM, XML declaration, PIs, comments.
+_XML_PROLOG_SKIP = re.compile(r"(?:[\s\ufeff]|<\?.*?\?>|<!--.*?-->)*", re.S)
+# XML 1.0 NCName (element names without a prefix).
+_NC_START = ("A-Z_a-z\u00c0-\u00d6\u00d8-\u00f6\u00f8-\u02ff\u0370-\u037d\u037f-\u1fff"
+             "\u200c\u200d\u2070-\u218f\u2c00-\u2fef\u3001-\ud7ff\uf900-\ufdcf\ufdf0-\ufffd"
+             "\U00010000-\U000effff")
+_XML_NCNAME = re.compile(f"[{_NC_START}][{_NC_START}\\-.0-9\u00b7\u0300-\u036f\u203f\u2040]*")
 
 # wrapper element -> item element (both directions)
 XML_ITEMS = {
@@ -387,7 +424,7 @@ def _el_to_json(el: Any, parent: str, spec: str) -> Any:
             if k in attrs:
                 attrs[k] = attrs[k] == "true" if typ is bool else _scalar("cwe", attrs[k])
     if "version" in attrs and tag == "bom":
-        attrs["version"] = int(attrs["version"]) if attrs["version"].isdigit() else attrs["version"]
+        attrs["version"] = int(attrs["version"]) if _is_ascii_digits(attrs["version"]) else attrs["version"]
     # attachedText: always an object in JSON
     if tag in ("text", "attachment") and parent in ("license", "note", "diff", "supportingMaterial"):
         return {**attrs, "content": text}
@@ -454,10 +491,14 @@ def _child_to_json(child: Any, ctag: str, tag: str, kind: str, spec: str) -> Any
 def xml_to_bom(text: str) -> Dict[str, Any]:
     """CycloneDX 1.4-1.6 XML -> JSON-model dict."""
 
-    if "<!DOCTYPE" in text or "<!ENTITY" in text:  # no XXE / billion laughs
+    # No XXE / billion laughs: a DOCTYPE (and so any ENTITY) can only sit in the
+    # prolog, so refuse any "<!" markup there (any case). Expat rejects it later on.
+    rest = text[_XML_PROLOG_SKIP.match(text).end():]  # type: ignore[union-attr]
+    if rest.startswith("<!"):
         raise TrimError("input XML has a DOCTYPE/ENTITY declaration; refusing to parse")
     try:
-        root = ET.fromstring(text.encode("utf-8"))
+        # Parse the decoded str: bytes would clash with a declared encoding="UTF-16".
+        root = ET.fromstring(text)
     except ET.ParseError as exc:
         raise TrimError(f"input is not valid XML: {exc}") from exc
     ns = root.tag[1:].split("}")[0] if root.tag.startswith("{") else ""
@@ -601,6 +642,11 @@ def bom_to_xml(bom: Dict[str, Any], indent: int = 2) -> str:
     body = {k: v for k, v in bom.items() if k not in ("$schema", "bomFormat", "specVersion")}
     _json_to_el(holder, "bom", body, "", ns)
     root = holder[0]
+    prefix = f"{{{ns}}}"
+    for el in root.iter():  # JSON keys become tags; ElementTree does not check names
+        name = el.tag[len(prefix):] if el.tag.startswith(prefix) else el.tag
+        if not (el.tag.startswith(prefix) and _XML_NCNAME.fullmatch(name)):
+            raise ValueError(f"{name!r} is not a valid XML element name")
     if indent > 0:
         ET.indent(root, space=" " * indent)
     text = ET.tostring(root, encoding="unicode")
@@ -855,8 +901,8 @@ def _check_preconditions(run: _Run) -> Set[str]:
                 "group/purl patterns instead."
             )
 
-    counts = Counter(c.get("bom-ref") for c, _ in run.comps if isinstance(c.get("bom-ref"), str))
-    dupes = sorted(r for r, n in counts.items() if n > 1)
+    refs: List[str] = [c["bom-ref"] for c, _ in run.comps if isinstance(c.get("bom-ref"), str)]
+    dupes = sorted(r for r, n in Counter(refs).items() if n > 1)
     if dupes:
         run.report.warnings.append(
             f"duplicate bom-refs in input (CycloneDX requires them to be unique): {', '.join(dupes[:5])}"
@@ -1000,7 +1046,7 @@ def _scrub_file_paths(run: _Run) -> None:
     ``outer.jar:inner.jar``; a kept inner jar would otherwise reveal the name of
     an excluded or redacted outer jar. Only --exclude/--redact hide names.
     """
-    hidden: List[Tuple[str, str]] = []
+    hidden: Dict[str, str] = {}  # hidden path -> replacement
     for comp, _ in run.comps:
         decision = run.removals.get(id(comp)) or run.redactions.get(id(comp))
         if not (decision and decision.hide):
@@ -1009,10 +1055,9 @@ def _scrub_file_paths(run: _Run) -> None:
         for path in (get_property(comp, VC_FILE_PATH), get_property(comp, SYFT_VIRTUAL_PATH)):
             if path:
                 cut = max(path.rfind(sep) for sep in ("/", "\\", ":", "#")) + 1
-                hidden.append((path, path[:cut] + REDACTED_NAME))
+                hidden.setdefault(path, path[:cut] + REDACTED_NAME)
     if not hidden:
         return
-    hidden.sort(key=lambda h: len(h[0]), reverse=True)
     for comp, _ in run.comps:
         if id(comp) in run.removals or id(comp) in run.redactions:
             continue
@@ -1020,13 +1065,28 @@ def _scrub_file_paths(run: _Run) -> None:
             if not (isinstance(prop, dict) and is_path_property(prop.get("name"))):
                 continue
             value = prop.get("value")
-            if not isinstance(value, str):
-                continue
-            for path, replacement in hidden:
-                # syft:location:N:path names the outer file itself (exact match).
-                if value == path or value.startswith(path + ":") or value.startswith(path + "#"):
-                    prop["value"] = replacement + value[len(path):]
-                    break
+            if isinstance(value, str):
+                new = _scrub_value(value, hidden)
+                if new is not None:
+                    prop["value"] = new
+
+
+def _scrub_value(value: str, hidden: Dict[str, str]) -> Optional[str]:
+    """Rewrite ``value`` if it is a hidden path or starts with one followed by ':' or '#'.
+
+    The longest hidden prefix wins. Dict lookups per separator keep this
+    O(len(value)) instead of O(hidden) per property.
+    """
+    if value in hidden:  # syft:location:N:path names the outer file itself
+        return hidden[value]
+    end = len(value)
+    while True:
+        end = max(value.rfind(":", 0, end), value.rfind("#", 0, end))
+        if end <= 0:
+            return None
+        prefix = value[:end]
+        if prefix in hidden:
+            return hidden[prefix] + value[end:]
 
 
 def _strip_paths(run: _Run) -> None:
@@ -1123,8 +1183,9 @@ def _rewrite_dependencies(run: _Run) -> None:
     for entry in run.bom["dependencies"]:
         if not isinstance(entry, dict):
             continue
-        ref = run.remap.get(entry.get("ref"), entry.get("ref"))
-        if entry.get("ref") in run.removed_refs:
+        old_ref = entry.get("ref")
+        ref = run.remap.get(old_ref, old_ref) if isinstance(old_ref, str) else old_ref
+        if old_ref in run.removed_refs:
             continue
         if ref not in known:
             dangling.add(str(ref))
@@ -1307,7 +1368,8 @@ def trim(bom_in: Dict[str, Any], opts: TrimOptions) -> Tuple[Dict[str, Any], Rep
     honoured with the data in the SBOM (no scope data, no dependency graph, ...).
     """
     bom = copy.deepcopy(bom_in)
-    metadata = bom.get("metadata") if isinstance(bom.get("metadata"), dict) else {}
+    md = bom.get("metadata")
+    metadata: Dict[str, Any] = md if isinstance(md, dict) else {}
     root = metadata.get("component") if isinstance(metadata.get("component"), dict) else None
     run = _Run(
         bom=bom,
@@ -1350,9 +1412,69 @@ def validate(text: str, spec_version: str, fmt: str = "json") -> Optional[str]:
     if fmt == "xml":
         from cyclonedx.validation.xml import XmlValidator as Validator  # type: ignore
     else:
+        fast = _fast_json_validator(spec_version)
+        if fast is not None:
+            error = next(iter(fast.iter_errors(json.loads(text))), None)
+            return None if error is None else str(error)
         from cyclonedx.validation.json import JsonStrictValidator as Validator  # type: ignore
     error = Validator(SchemaVersion.from_version(spec_version)).validate_str(text)
     return None if error is None else str(error)
+
+
+_FAST_VALIDATORS: Dict[str, Any] = {}
+
+
+def _fast_json_validator(spec_version: str) -> Any:
+    """cyclonedx's strict JSON validator with an O(n) ``uniqueItems``; None if unavailable.
+
+    jsonschema checks ``uniqueItems`` pairwise (O(n^2): 10k components > 60 s).
+    Same schema, registry and format checker, so accept/reject decisions and
+    messages are unchanged. Uses library internals, hence the broad fallback.
+    """
+    if spec_version not in _FAST_VALIDATORS:
+        fast = None
+        try:
+            from cyclonedx.schema import SchemaVersion  # type: ignore
+            from cyclonedx.validation.json import JsonStrictValidator  # type: ignore
+            from jsonschema.validators import extend  # type: ignore
+
+            ref = JsonStrictValidator(SchemaVersion.from_version(spec_version))._validator
+            cls = extend(type(ref), {"uniqueItems": _unique_items})
+            fast = cls(ref.schema, registry=ref._registry, format_checker=ref.format_checker)
+        except Exception:  # noqa: BLE001 - missing extra or changed internals: use the library path
+            fast = None
+        _FAST_VALIDATORS[spec_version] = fast
+    return _FAST_VALIDATORS[spec_version]
+
+
+def _unique_items(validator: Any, unique: Any, instance: Any, schema: Any) -> Iterator[Any]:
+    """``uniqueItems`` keyword with a hash set; same message as jsonschema's."""
+    if not (unique and validator.is_type(instance, "array")):
+        return
+    seen: Set[Any] = set()
+    for item in instance:
+        key = _json_key(item)
+        if key in seen:
+            from jsonschema.exceptions import ValidationError  # type: ignore
+
+            yield ValidationError(f"{instance!r} has non-unique elements")
+            return
+        seen.add(key)
+
+
+def _json_key(value: Any) -> Any:
+    """Hashable key equal exactly when jsonschema's ``equal`` is (true != 1, 1 == 1.0)."""
+    if isinstance(value, bool):
+        return ("b", value)
+    if isinstance(value, (int, float)):
+        return ("n", value)
+    if isinstance(value, str):
+        return ("s", value)
+    if isinstance(value, list):
+        return ("l", tuple(_json_key(v) for v in value))
+    if isinstance(value, dict):
+        return ("d", frozenset((k, _json_key(v)) for k, v in value.items()))
+    return ("o", value)
 
 
 def _same_file(a: str, b: str) -> bool:
@@ -1422,6 +1544,15 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: Optional[List[str]] = None) -> int:
     """CLI entry point; returns the process exit code."""
+    for stream in (sys.stdout, sys.stderr):
+        # A cp1252 console/pipe (Windows, PYTHONUTF8=0) must not crash --report
+        # after the output was written; unencodable characters become \uXXXX.
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None:
+            try:
+                reconfigure(errors="backslashreplace")
+            except (ValueError, OSError):
+                pass
     args = build_parser().parse_args(argv)
     try:
         if _same_file(args.input, args.output):
@@ -1447,11 +1578,14 @@ def main(argv: Optional[List[str]] = None) -> int:
                 raise TrimError(f"cannot write XML: non-standard structure in the SBOM ({exc}); "
                                 "use --output-format json") from exc
         else:
-            text = json.dumps(out, indent=args.indent, ensure_ascii=False) + "\n"
-            try:
-                text.encode("utf-8")
-            except UnicodeEncodeError:  # lone surrogates from \uD800-style input escapes
-                text = json.dumps(out, indent=args.indent) + "\n"
+            try:  # allow_nan=False: NaN/Infinity (e.g. from an XML <score>NaN</score>) is not JSON
+                text = json.dumps(out, indent=args.indent, ensure_ascii=False, allow_nan=False) + "\n"
+                try:
+                    text.encode("utf-8")
+                except UnicodeEncodeError:  # lone surrogates from \uD800-style input escapes
+                    text = json.dumps(out, indent=args.indent, allow_nan=False) + "\n"
+            except ValueError as exc:
+                raise TrimError(f"cannot write JSON: {exc}") from exc
         if not args.no_validate:
             try:
                 error = validate(text, out["specVersion"], out_fmt)
@@ -1466,6 +1600,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         write_json(args.output, text)
     except TrimError as exc:
         print(f"error: {exc}", file=sys.stderr)
+        return EXIT_INPUT
+    except RecursionError:  # deep structures that slipped past _check_shape
+        print("error: input is nested too deeply to process", file=sys.stderr)
         return EXIT_INPUT
     if args.direct_only:
         print(CISA_WARNING, file=sys.stderr)
